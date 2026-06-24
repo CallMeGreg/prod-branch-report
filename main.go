@@ -218,25 +218,44 @@ func getProtectedBranches(owner, repo string) ([]string, error) {
 func getRulesetBranches(org, owner, repo string) ([]string, error) {
 	seen := map[string]bool{}
 
-	// Repo-level rulesets
+	type rulesetSummary struct {
+		ID          int    `json:"id"`
+		Name        string `json:"name"`
+		Target      string `json:"target"`
+		Enforcement string `json:"enforcement"`
+		SourceType  string `json:"source_type"`
+	}
+
+	type rulesetDetail struct {
+		ID         int    `json:"id"`
+		Target     string `json:"target"`
+		Conditions struct {
+			RefName struct {
+				Include []string `json:"include"`
+			} `json:"ref_name"`
+			RepositoryName struct {
+				Include []string `json:"include"`
+			} `json:"repository_name"`
+		} `json:"conditions"`
+	}
+
+	// Repo-level rulesets (list endpoint doesn't include conditions, must fetch each)
 	body, _, err := doREST("GET", fmt.Sprintf("/repos/%s/%s/rulesets", owner, repo))
 	if err == nil {
-		var rulesets []struct {
-			Name        string `json:"name"`
-			Target      string `json:"target"`
-			Enforcement string `json:"enforcement"`
-			Conditions  struct {
-				RefName struct {
-					Include []string `json:"include"`
-				} `json:"ref_name"`
-			} `json:"conditions"`
-		}
+		var rulesets []rulesetSummary
 		json.Unmarshal(body, &rulesets)
 		for _, rs := range rulesets {
 			if rs.Enforcement != "active" || rs.Target != "branch" {
 				continue
 			}
-			for _, pattern := range rs.Conditions.RefName.Include {
+			// Fetch individual ruleset to get conditions
+			detailBody, _, err := doREST("GET", fmt.Sprintf("/repos/%s/%s/rulesets/%d", owner, repo, rs.ID))
+			if err != nil {
+				continue
+			}
+			var detail rulesetDetail
+			json.Unmarshal(detailBody, &detail)
+			for _, pattern := range detail.Conditions.RefName.Include {
 				b := strings.TrimPrefix(pattern, "refs/heads/")
 				if b == "~DEFAULT_BRANCH" || b == "" {
 					b = "~DEFAULT_BRANCH"
@@ -249,27 +268,23 @@ func getRulesetBranches(org, owner, repo string) ([]string, error) {
 	// Org-level rulesets (may apply to this repo)
 	body, _, err = doREST("GET", fmt.Sprintf("/orgs/%s/rulesets", org))
 	if err == nil {
-		var orgRulesets []struct {
-			Name        string `json:"name"`
-			Target      string `json:"target"`
-			Enforcement string `json:"enforcement"`
-			Conditions  struct {
-				RefName struct {
-					Include []string `json:"include"`
-				} `json:"ref_name"`
-				RepositoryName struct {
-					Include []string `json:"include"`
-				} `json:"repository_name"`
-			} `json:"conditions"`
-		}
+		var orgRulesets []rulesetSummary
 		json.Unmarshal(body, &orgRulesets)
 		for _, rs := range orgRulesets {
 			if rs.Enforcement != "active" || rs.Target != "branch" {
 				continue
 			}
+			// Fetch individual ruleset to get conditions
+			detailBody, _, err := doREST("GET", fmt.Sprintf("/orgs/%s/rulesets/%d", org, rs.ID))
+			if err != nil {
+				continue
+			}
+			var detail rulesetDetail
+			json.Unmarshal(detailBody, &detail)
+
 			// Check if this ruleset applies to our repo
-			applies := len(rs.Conditions.RepositoryName.Include) == 0 // empty = all repos
-			for _, pattern := range rs.Conditions.RepositoryName.Include {
+			applies := len(detail.Conditions.RepositoryName.Include) == 0
+			for _, pattern := range detail.Conditions.RepositoryName.Include {
 				if matchesSimplePattern(pattern, repo) {
 					applies = true
 					break
@@ -278,7 +293,7 @@ func getRulesetBranches(org, owner, repo string) ([]string, error) {
 			if !applies {
 				continue
 			}
-			for _, pattern := range rs.Conditions.RefName.Include {
+			for _, pattern := range detail.Conditions.RefName.Include {
 				b := strings.TrimPrefix(pattern, "refs/heads/")
 				if b == "~DEFAULT_BRANCH" || b == "" {
 					b = "~DEFAULT_BRANCH"
