@@ -214,8 +214,8 @@ func getProtectedBranches(owner, repo string) ([]string, error) {
 	return patterns, nil
 }
 
-// Signal: Repository rulesets (branch targets) — includes org-level rulesets
-func getRulesetBranches(org, owner, repo string) ([]string, error) {
+// Signal: Repository rulesets (branch targets)
+func getRulesetBranches(owner, repo string) ([]string, error) {
 	seen := map[string]bool{}
 
 	type rulesetSummary struct {
@@ -223,7 +223,6 @@ func getRulesetBranches(org, owner, repo string) ([]string, error) {
 		Name        string `json:"name"`
 		Target      string `json:"target"`
 		Enforcement string `json:"enforcement"`
-		SourceType  string `json:"source_type"`
 	}
 
 	type rulesetDetail struct {
@@ -233,9 +232,6 @@ func getRulesetBranches(org, owner, repo string) ([]string, error) {
 			RefName struct {
 				Include []string `json:"include"`
 			} `json:"ref_name"`
-			RepositoryName struct {
-				Include []string `json:"include"`
-			} `json:"repository_name"`
 		} `json:"conditions"`
 	}
 
@@ -265,61 +261,12 @@ func getRulesetBranches(org, owner, repo string) ([]string, error) {
 		}
 	}
 
-	// Org-level rulesets (may apply to this repo)
-	body, _, err = doREST("GET", fmt.Sprintf("/orgs/%s/rulesets", org))
-	if err == nil {
-		var orgRulesets []rulesetSummary
-		json.Unmarshal(body, &orgRulesets)
-		for _, rs := range orgRulesets {
-			if rs.Enforcement != "active" || rs.Target != "branch" {
-				continue
-			}
-			// Fetch individual ruleset to get conditions
-			detailBody, _, err := doREST("GET", fmt.Sprintf("/orgs/%s/rulesets/%d", org, rs.ID))
-			if err != nil {
-				continue
-			}
-			var detail rulesetDetail
-			json.Unmarshal(detailBody, &detail)
-
-			// Check if this ruleset applies to our repo
-			applies := len(detail.Conditions.RepositoryName.Include) == 0
-			for _, pattern := range detail.Conditions.RepositoryName.Include {
-				if matchesSimplePattern(pattern, repo) {
-					applies = true
-					break
-				}
-			}
-			if !applies {
-				continue
-			}
-			for _, pattern := range detail.Conditions.RefName.Include {
-				b := strings.TrimPrefix(pattern, "refs/heads/")
-				if b == "~DEFAULT_BRANCH" || b == "" {
-					b = "~DEFAULT_BRANCH"
-				}
-				seen[b] = true
-			}
-		}
-	}
-
 	var result []string
 	for b := range seen {
 		result = append(result, b)
 	}
 	sort.Strings(result)
 	return result, nil
-}
-
-// matchesSimplePattern handles basic glob matching (only trailing *)
-func matchesSimplePattern(pattern, name string) bool {
-	if pattern == "*" {
-		return true
-	}
-	if strings.HasSuffix(pattern, "*") {
-		return strings.HasPrefix(name, strings.TrimSuffix(pattern, "*"))
-	}
-	return pattern == name
 }
 
 // Signal: Deployments to production
@@ -893,7 +840,7 @@ func main() {
 
 		// Collect signals
 		r.ProtectedBranches, _ = getProtectedBranches(owner, repoName)
-		r.RulesetTargetBranches, _ = getRulesetBranches(org, owner, repoName)
+		r.RulesetTargetBranches, _ = getRulesetBranches(owner, repoName)
 		r.DeploymentBranches, _ = getDeploymentBranches(owner, repoName)
 		r.ReleaseTargetBranches, _ = getReleaseBranches(owner, repoName)
 
