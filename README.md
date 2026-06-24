@@ -22,14 +22,14 @@ This tool doesn't try to give you a definitive answer. Instead, it produces a **
 |--------|-------------------|------------|
 | Default Branch | The repo's configured default | GraphQL: `defaultBranchRef` |
 | Protected Branches | Branches with protection rules (patterns) | GraphQL: `branchProtectionRules` |
-| Ruleset Target Branches | Branches targeted by active rulesets (repo + org level) | REST: `/repos/{o}/{r}/rulesets` + `/orgs/{o}/rulesets` |
+| Ruleset Target Branches | Branches targeted by active repo-level rulesets | REST: `/repos/{o}/{r}/rulesets` + `/repos/{o}/{r}/rulesets/{id}` |
 | Deployment Branches (prod) | Branches that have been deployed to a "production" environment | GraphQL: `deployments(environments: ["production"])` |
 | Release Target Branches | Branches that releases were cut from | REST: `/repos/{o}/{r}/releases` → `target_commitish` |
 | Tagged Branches (by count) | Branches with the most release tags | REST: releases grouped by `target_commitish` |
 | Top PR Merge Target | Branch receiving the most merged PRs | REST: `/repos/{o}/{r}/pulls?base={branch}` |
 | Workflow Push Branches | Branches listed in `on.push.branches` in GitHub Actions workflows | REST: contents API + YAML parsing |
 | Most Active Branch (6mo) | Branch with the highest commit count in the last 6 months | GraphQL: `history(since: ...)` |
-| Oldest Branch | Branch with the oldest reachable commit | GraphQL: `history(last: 1)` |
+| Deepest Branch (total commits) | Branch with the most total commits (proxy for longest-lived) | GraphQL: `history(first: 0)` → `totalCount` |
 
 ## Usage
 
@@ -47,13 +47,14 @@ go run main.go <org-slug>
 ## Requirements
 
 - Go 1.21+
-- A GitHub token with `repo`, `read:org` scopes (or a GitHub App with equivalent permissions)
-- For org-level rulesets: `admin:org` scope
+- A GitHub token with `repo` scope (or a GitHub App with equivalent permissions)
+- Falls back to `gh auth token` if `GITHUB_TOKEN` is not set
 
 ## Limitations
 
 - Only checks the first 100 releases per repo (most recent)
-- Compares top 5 candidate branches for expensive per-branch queries (commit velocity, PR counts, branch age)
+- Compares top 5 candidate branches for expensive per-branch queries (commit velocity, PR counts, branch depth)
 - Workflow YAML parsing is basic (line-based, not a full YAML parser)
 - Tag-to-branch mapping uses release `target_commitish` rather than git ancestry (faster, but misses tags not associated with releases)
+- Rulesets are checked at the repo level only (org-level rulesets require `admin:org` scope and are not included)
 - Rate limits may require multiple runs for large orgs (500+ repos)
