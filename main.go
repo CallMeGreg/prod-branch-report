@@ -916,6 +916,87 @@ func unique(ss []string) []string {
 	return out
 }
 
+// ---------- Lightweight mode (combined query, 2 API calls per repo) ----------
+
+// getLightweightSignals fetches protection rules + deployments in a single
+// GraphQL query, then releases in a single REST call. This is ~5x faster than
+// the full analysis since it avoids per-branch queries entirely.
+func getLightweightSignals(owner, repo string) (protectedBranches []string, deploymentBranches []string, releaseBranches []string, taggedBranches []string, err error) {
+	// Single GraphQL query for protection rules + deployments
+	query := `query($owner: String!, $repo: String!) {
+		repository(owner: $owner, name: $repo) {
+			branchProtectionRules(first: 50) {
+				nodes { pattern }
+			}
+			deployments(first: 100, environments: ["production"]) {
+				nodes {
+					ref { name }
+				}
+			}
+		}
+	}`
+
+	data, err := doGraphQL(query, map[string]interface{}{"owner": owner, "repo": repo})
+	if err != nil {
+		return nil, nil, nil, nil, err
+	}
+
+	var result struct {
+		Repository struct {
+			BranchProtectionRules struct {
+				Nodes []struct{ Pattern string }
+			}
+			Deployments struct {
+				Nodes []struct {
+					Ref *struct{ Name string }
+				}
+			}
+		}
+	}
+	json.Unmarshal(data, &result)
+
+	for _, n := range result.Repository.BranchProtectionRules.Nodes {
+		protectedBranches = append(protectedBranches, n.Pattern)
+	}
+
+	deployCounts := map[string]int{}
+	for _, n := range result.Repository.Deployments.Nodes {
+		if n.Ref != nil && n.Ref.Name != "" {
+			deployCounts[n.Ref.Name]++
+		}
+	}
+	deploymentBranches = sortedKeysByValue(deployCounts)
+
+	// Single REST call for releases + tags
+	body, _, restErr := doREST("GET", fmt.Sprintf("/repos/%s/%s/releases?per_page=%d", owner, repo, perPageREST))
+	if restErr == nil {
+		var releases []struct {
+			TargetCommitish string `json:"target_commitish"`
+			TagName         string `json:"tag_name"`
+			Draft           bool   `json:"draft"`
+		}
+		json.Unmarshal(body, &releases)
+
+		releaseCounts := map[string]int{}
+		tagCounts := map[string]int{}
+		for _, r := range releases {
+			if r.Draft {
+				continue
+			}
+			if r.TargetCommitish != "" {
+				releaseCounts[r.TargetCommitish]++
+				if r.TagName != "" {
+					tagCounts[r.TargetCommitish]++
+				}
+			}
+		}
+		releaseBranches = sortedKeysByValue(releaseCounts)
+		taggedBranches = sortedKeysByValue(tagCounts)
+	}
+
+	return protectedBranches, deploymentBranches, releaseBranches, taggedBranches, nil
+}
+
 // ---------- AI Hypothesis (Copilot SDK) ----------
 
 func formatSignalSummary(r RepoResult) string {
@@ -1063,19 +1144,25 @@ Rules:
 
 func main() {
 	if len(os.Args) < 2 {
-		pterm.Error.Println("Usage: prod-branch-report <org-slug> [output.csv] [--analyze]")
+		pterm.Error.Println("Usage: prod-branch-report <org-slug> [output.csv] [--light] [--analyze]")
 		os.Exit(1)
 	}
 
 	org := os.Args[1]
 	outputFile := ""
 	analyze := false
+	light := false
 
 	for _, arg := range os.Args[2:] {
-		if arg == "--analyze" {
+		switch arg {
+		case "--analyze":
 			analyze = true
-		} else if outputFile == "" {
-			outputFile = arg
+		case "--light":
+			light = true
+		default:
+			if outputFile == "" {
+				outputFile = arg
+			}
 		}
 	}
 
@@ -1087,6 +1174,11 @@ func main() {
 		Println("Production Branch Report")
 	fmt.Println()
 	pterm.Info.Printfln("Organization: %s", pterm.Bold.Sprint(org))
+	if light {
+		pterm.Info.Println("Mode: lightweight (4 signals, ~2 API calls/repo)")
+	} else {
+		pterm.Info.Println("Mode: full (10 signals, ~10+ API calls/repo)")
+	}
 
 	// Phase 1: Enumerate repos
 	spinner, _ := pterm.DefaultSpinner.Start("Discovering repositories...")
@@ -1122,22 +1214,27 @@ func main() {
 			DefaultBranch: repo.DefaultBranchName,
 		}
 
-		// Get candidate branches for expensive per-branch queries
-		candidates, _ := listCandidateBranches(owner, repoName, repo.DefaultBranchName)
+		if light {
+			// Lightweight: 1 GraphQL + 1 REST call per repo
+			r.ProtectedBranches, r.DeploymentBranches, r.ReleaseTargetBranches, r.TaggedBranches, _ =
+				getLightweightSignals(owner, repoName)
+		} else {
+			// Full: ~10+ API calls per repo
+			candidates, _ := listCandidateBranches(owner, repoName, repo.DefaultBranchName)
 
-		// Collect signals
-		r.ProtectedBranches, _ = getProtectedBranches(owner, repoName)
-		r.RulesetTargetBranches, _ = getRulesetBranches(owner, repoName)
-		r.DeploymentBranches, _ = getDeploymentBranches(owner, repoName)
-		r.ReleaseTargetBranches, _ = getReleaseBranches(owner, repoName)
+			r.ProtectedBranches, _ = getProtectedBranches(owner, repoName)
+			r.RulesetTargetBranches, _ = getRulesetBranches(owner, repoName)
+			r.DeploymentBranches, _ = getDeploymentBranches(owner, repoName)
+			r.ReleaseTargetBranches, _ = getReleaseBranches(owner, repoName)
 
-		tagCounts, _ := getTagCountByBranch(owner, repoName)
-		r.TaggedBranches = sortedKeysByValue(tagCounts)
+			tagCounts, _ := getTagCountByBranch(owner, repoName)
+			r.TaggedBranches = sortedKeysByValue(tagCounts)
 
-		r.TopPRMergeTarget, _ = getTopPRMergeTarget(owner, repoName, candidates)
-		r.WorkflowPushBranches, _ = getWorkflowPushBranches(owner, repoName)
-		r.MostActiveCommitBranch, _ = getMostActiveBranch(owner, repoName, candidates)
-		r.OldestBranch, _ = getOldestBranch(owner, repoName, candidates)
+			r.TopPRMergeTarget, _ = getTopPRMergeTarget(owner, repoName, candidates)
+			r.WorkflowPushBranches, _ = getWorkflowPushBranches(owner, repoName)
+			r.MostActiveCommitBranch, _ = getMostActiveBranch(owner, repoName, candidates)
+			r.OldestBranch, _ = getOldestBranch(owner, repoName, candidates)
+		}
 
 		results = append(results, r)
 		progressBar.Increment()

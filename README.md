@@ -55,12 +55,27 @@ export GITHUB_TOKEN=ghp_...
 # Run against an org, output to CSV
 go run main.go <org-slug> report.csv
 
+# Lightweight mode — 4 signals, ~2 API calls/repo (~5x faster)
+go run main.go <org-slug> report.csv --light
+
 # Include AI hypothesis
 go run main.go <org-slug> report.csv --analyze
+
+# Combine lightweight + AI hypothesis
+go run main.go <org-slug> report.csv --light --analyze
 
 # Output to stdout
 go run main.go <org-slug>
 ```
+
+### Modes
+
+| Mode | Signals | API calls/repo | Speed |
+|------|---------|----------------|-------|
+| Full (default) | 10 | ~10+ | ~8 min for 110 repos |
+| `--light` | 4 | ~2 | ~1.5 min for 110 repos |
+
+**Lightweight mode** collects only: default branch, protected branches, deployment branches (prod), release target branches, and tagged branches. It skips rulesets, PR merge targets, workflow analysis, commit velocity, and branch depth — these all require many additional API calls per repo.
 
 ## Requirements
 
