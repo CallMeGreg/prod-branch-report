@@ -38,7 +38,7 @@ type RepoResult struct {
 	TopPRMergeTarget        string   // branch receiving the most merged PRs
 	WorkflowPushBranches    []string // branches in on.push.branches triggers
 	MostActiveCommitBranch  string   // branch with highest commit count in lookback
-	OldestBranch            string   // branch with the oldest first commit
+	OldestBranch            string   // branch with the most total commits (deepest history)
 }
 
 // ---------- GraphQL helpers ----------
@@ -641,7 +641,7 @@ func getMostActiveBranch(owner, repo string, branches []string) (string, error) 
 	return fmt.Sprintf("%s (%d commits)", results[0].branch, results[0].count), nil
 }
 
-// Signal: Oldest branch
+// Signal: Oldest branch (by total commit depth — more commits = longer-lived)
 func getOldestBranch(owner, repo string, branches []string) (string, error) {
 	if len(branches) == 0 {
 		return "", nil
@@ -652,11 +652,11 @@ func getOldestBranch(owner, repo string, branches []string) (string, error) {
 		limit = len(branches)
 	}
 
-	type branchAge struct {
+	type branchDepth struct {
 		branch string
-		date   time.Time
+		count  int
 	}
-	var results []branchAge
+	var results []branchDepth
 
 	for _, branch := range branches[:limit] {
 		query := `query($owner: String!, $repo: String!, $branch: String!) {
@@ -664,10 +664,8 @@ func getOldestBranch(owner, repo string, branches []string) (string, error) {
 				ref(qualifiedName: $branch) {
 					target {
 						... on Commit {
-							history(last: 1) {
-								nodes {
-									committedDate
-								}
+							history(first: 0) {
+								totalCount
 							}
 						}
 					}
@@ -688,19 +686,17 @@ func getOldestBranch(owner, repo string, branches []string) (string, error) {
 				Ref *struct {
 					Target struct {
 						History struct {
-							Nodes []struct {
-								CommittedDate time.Time
-							}
+							TotalCount int
 						}
 					}
 				}
 			}
 		}
 		json.Unmarshal(data, &result)
-		if result.Repository.Ref != nil && len(result.Repository.Ref.Target.History.Nodes) > 0 {
-			results = append(results, branchAge{
+		if result.Repository.Ref != nil {
+			results = append(results, branchDepth{
 				branch: branch,
-				date:   result.Repository.Ref.Target.History.Nodes[0].CommittedDate,
+				count:  result.Repository.Ref.Target.History.TotalCount,
 			})
 		}
 	}
@@ -708,8 +704,8 @@ func getOldestBranch(owner, repo string, branches []string) (string, error) {
 	if len(results) == 0 {
 		return "", nil
 	}
-	sort.Slice(results, func(i, j int) bool { return results[i].date.Before(results[j].date) })
-	return fmt.Sprintf("%s (since %s)", results[0].branch, results[0].date.Format("2006-01-02")), nil
+	sort.Slice(results, func(i, j int) bool { return results[i].count > results[j].count })
+	return fmt.Sprintf("%s (%d total commits)", results[0].branch, results[0].count), nil
 }
 
 // Signal: list candidate branches (top branches by various signals)
@@ -926,7 +922,7 @@ func main() {
 		"Top PR Merge Target",
 		"Workflow Push Branches",
 		"Most Active Branch (6mo)",
-		"Oldest Branch",
+		"Deepest Branch (total commits)",
 	}
 	writer.Write(header)
 
