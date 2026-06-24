@@ -1,0 +1,5 @@
+# Generated reports
+*.csv
+
+# Binary
+prod-branch-report
