@@ -7,13 +7,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/pterm/pterm"
 )
 
 // ---------- Configuration ----------
@@ -60,57 +63,158 @@ func getToken() string {
 	if token != "" {
 		return token
 	}
-	// Fall back to gh CLI token
 	out, err := exec.Command("gh", "auth", "token").Output()
 	if err != nil {
-		log.Fatal("No GITHUB_TOKEN set and `gh auth token` failed. Provide a token.")
+		pterm.Fatal.Println("No GITHUB_TOKEN set and `gh auth token` failed. Provide a token.")
 	}
 	return strings.TrimSpace(string(out))
 }
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
 var authToken string
+var rateLimitMu sync.Mutex
+
+// handleRateLimit checks response headers for rate limiting and waits if needed.
+// Returns true if the request should be retried.
+func handleRateLimit(resp *http.Response, source string) bool {
+	if resp == nil {
+		return false
+	}
+
+	// Secondary rate limit: 403 or 429 with Retry-After header
+	if resp.StatusCode == 403 || resp.StatusCode == 429 {
+		retryAfter := resp.Header.Get("Retry-After")
+		if retryAfter != "" {
+			seconds, err := strconv.Atoi(retryAfter)
+			if err != nil {
+				seconds = 60
+			}
+			waitForRateLimit(time.Duration(seconds)*time.Second, "secondary", source)
+			return true
+		}
+		// Check if it's a rate limit message in body
+		body, _ := io.ReadAll(resp.Body)
+		if strings.Contains(string(body), "rate limit") || strings.Contains(string(body), "abuse") {
+			waitForRateLimit(60*time.Second, "secondary", source)
+			return true
+		}
+	}
+
+	// Primary rate limit: X-RateLimit-Remaining is 0
+	remaining := resp.Header.Get("X-RateLimit-Remaining")
+	if remaining == "0" {
+		resetStr := resp.Header.Get("X-RateLimit-Reset")
+		if resetStr != "" {
+			resetUnix, err := strconv.ParseInt(resetStr, 10, 64)
+			if err == nil {
+				resetTime := time.Unix(resetUnix, 0)
+				waitDuration := time.Until(resetTime) + 1*time.Second
+				if waitDuration > 0 {
+					resource := resp.Header.Get("X-RateLimit-Resource")
+					if resource == "" {
+						resource = "core"
+					}
+					waitForRateLimit(waitDuration, "primary ("+resource+")", source)
+					return true
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func waitForRateLimit(duration time.Duration, limitType, source string) {
+	rateLimitMu.Lock()
+	defer rateLimitMu.Unlock()
+
+	resumeAt := time.Now().Add(duration)
+	pterm.Warning.Printfln("⏳ %s rate limit hit (%s). Waiting %s (resuming at %s)",
+		limitType, source, duration.Round(time.Second), resumeAt.Format("15:04:05"))
+
+	// Show a countdown spinner
+	spinner, _ := pterm.DefaultSpinner.
+		WithRemoveWhenDone(true).
+		Start(fmt.Sprintf("Rate limited — resuming in %s...", duration.Round(time.Second)))
+
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-timer.C:
+			spinner.Success("Rate limit wait complete. Resuming...")
+			return
+		case <-ticker.C:
+			remaining := time.Until(resumeAt).Round(time.Second)
+			spinner.UpdateText(fmt.Sprintf("Rate limited — resuming in %s...", remaining))
+		}
+	}
+}
 
 func doGraphQL(query string, variables map[string]interface{}) (json.RawMessage, error) {
-	body, _ := json.Marshal(graphQLRequest{Query: query, Variables: variables})
-	req, _ := http.NewRequest("POST", graphqlURL, bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("Content-Type", "application/json")
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		body, _ := json.Marshal(graphQLRequest{Query: query, Variables: variables})
+		req, _ := http.NewRequest("POST", graphqlURL, bytes.NewReader(body))
+		req.Header.Set("Authorization", "Bearer "+authToken)
+		req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
 
-	data, _ := io.ReadAll(resp.Body)
-	var gqlResp graphQLResponse
-	if err := json.Unmarshal(data, &gqlResp); err != nil {
-		return nil, fmt.Errorf("graphql unmarshal: %w\nraw: %s", err, string(data))
+		if handleRateLimit(resp, "GraphQL") {
+			resp.Body.Close()
+			continue
+		}
+
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		var gqlResp graphQLResponse
+		if err := json.Unmarshal(data, &gqlResp); err != nil {
+			return nil, fmt.Errorf("graphql unmarshal: %w\nraw: %s", err, string(data))
+		}
+		if len(gqlResp.Errors) > 0 {
+			return gqlResp.Data, fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
+		}
+		return gqlResp.Data, nil
 	}
-	if len(gqlResp.Errors) > 0 {
-		return gqlResp.Data, fmt.Errorf("graphql error: %s", gqlResp.Errors[0].Message)
-	}
-	return gqlResp.Data, nil
+	return nil, fmt.Errorf("graphql: max retries exceeded due to rate limiting")
 }
 
 func doREST(method, path string) ([]byte, http.Header, error) {
-	url := restBaseURL + path
-	req, _ := http.NewRequest(method, url, nil)
-	req.Header.Set("Authorization", "Bearer "+authToken)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		url := restBaseURL + path
+		req, _ := http.NewRequest(method, url, nil)
+		req.Header.Set("Authorization", "Bearer "+authToken)
+		req.Header.Set("Accept", "application/vnd.github+json")
+		req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, nil, err
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			return nil, nil, err
+		}
+
+		if handleRateLimit(resp, "REST "+method+" "+path) {
+			resp.Body.Close()
+			continue
+		}
+
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			return nil, resp.Header, fmt.Errorf("REST %s %s: %d %s", method, path, resp.StatusCode, string(body))
+		}
+		return body, resp.Header, nil
 	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode >= 400 {
-		return nil, resp.Header, fmt.Errorf("REST %s %s: %d %s", method, path, resp.StatusCode, string(body))
-	}
-	return body, resp.Header, nil
+	return nil, nil, fmt.Errorf("REST %s %s: max retries exceeded due to rate limiting", method, path)
 }
 
 // ---------- Phase 1: Enumerate repos ----------
@@ -804,7 +908,7 @@ func unique(ss []string) []string {
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, "Usage: %s <org-slug> [output.csv]\n", os.Args[0])
+		pterm.Error.Println("Usage: prod-branch-report <org-slug> [output.csv]")
 		os.Exit(1)
 	}
 
@@ -816,19 +920,41 @@ func main() {
 
 	authToken = getToken()
 
-	log.Printf("Enumerating repositories in org: %s", org)
+	// Header
+	pterm.DefaultHeader.WithBackgroundStyle(pterm.NewStyle(pterm.BgCyan)).
+		WithTextStyle(pterm.NewStyle(pterm.FgBlack)).
+		Println("Production Branch Report")
+	fmt.Println()
+	pterm.Info.Printfln("Organization: %s", pterm.Bold.Sprint(org))
+
+	// Phase 1: Enumerate repos
+	spinner, _ := pterm.DefaultSpinner.Start("Discovering repositories...")
 	repos, err := listOrgRepos(org)
 	if err != nil {
-		log.Fatalf("Failed to list repos: %v", err)
+		spinner.Fail(fmt.Sprintf("Failed to list repos: %v", err))
+		os.Exit(1)
 	}
-	log.Printf("Found %d repositories", len(repos))
+	spinner.Success(fmt.Sprintf("Found %d repositories", len(repos)))
+	fmt.Println()
 
+	// Phase 2: Analyze repos with progress bar
 	var results []RepoResult
 
-	for i, repo := range repos {
-		log.Printf("[%d/%d] Analyzing %s...", i+1, len(repos), repo.NameWithOwner)
+	progressBar, _ := pterm.DefaultProgressbar.
+		WithTotal(len(repos)).
+		WithTitle("Analyzing repositories").
+		WithBarCharacter("█").
+		WithLastCharacter("█").
+		WithElapsedTimeRoundingFactor(time.Second).
+		WithShowElapsedTime(true).
+		WithShowCount(true).
+		Start()
+
+	for _, repo := range repos {
 		parts := strings.SplitN(repo.NameWithOwner, "/", 2)
 		owner, repoName := parts[0], parts[1]
+
+		progressBar.UpdateTitle(fmt.Sprintf("Analyzing %s", repo.Name))
 
 		r := RepoResult{
 			Name:          repo.NameWithOwner,
@@ -853,17 +979,17 @@ func main() {
 		r.OldestBranch, _ = getOldestBranch(owner, repoName, candidates)
 
 		results = append(results, r)
-
-		// Small delay to avoid secondary rate limits
-		time.Sleep(100 * time.Millisecond)
+		progressBar.Increment()
 	}
 
-	// Write CSV output
+	fmt.Println()
+
+	// Phase 3: Write CSV output
 	var writer *csv.Writer
 	if outputFile != "" {
 		f, err := os.Create(outputFile)
 		if err != nil {
-			log.Fatalf("Failed to create output file: %v", err)
+			pterm.Fatal.Printfln("Failed to create output file: %v", err)
 		}
 		defer f.Close()
 		writer = csv.NewWriter(f)
@@ -872,7 +998,6 @@ func main() {
 	}
 	defer writer.Flush()
 
-	// Header
 	header := []string{
 		"Repository",
 		"Default Branch",
@@ -905,7 +1030,53 @@ func main() {
 		writer.Write(row)
 	}
 
+	// Summary
+	fmt.Println()
 	if outputFile != "" {
-		log.Printf("Report written to %s", outputFile)
+		pterm.Success.Printfln("Report written to %s (%d repos)", outputFile, len(results))
+	} else {
+		pterm.Success.Printfln("Report complete (%d repos)", len(results))
 	}
+
+	// Print signal coverage summary
+	signalNames := []string{
+		"Protected Branches", "Ruleset Targets", "Deployments (prod)",
+		"Release Targets", "Tagged Branches", "PR Merge Target",
+		"Workflow Push", "Commit Activity", "Branch Depth",
+	}
+	var coverageData pterm.TableData
+	coverageData = append(coverageData, []string{"Signal", "Repos with data", "Coverage"})
+	for i, name := range signalNames {
+		count := 0
+		for _, r := range results {
+			switch i {
+			case 0:
+				if len(r.ProtectedBranches) > 0 { count++ }
+			case 1:
+				if len(r.RulesetTargetBranches) > 0 { count++ }
+			case 2:
+				if len(r.DeploymentBranches) > 0 { count++ }
+			case 3:
+				if len(r.ReleaseTargetBranches) > 0 { count++ }
+			case 4:
+				if len(r.TaggedBranches) > 0 { count++ }
+			case 5:
+				if r.TopPRMergeTarget != "" { count++ }
+			case 6:
+				if len(r.WorkflowPushBranches) > 0 { count++ }
+			case 7:
+				if r.MostActiveCommitBranch != "" { count++ }
+			case 8:
+				if r.OldestBranch != "" { count++ }
+			}
+		}
+		pct := 0
+		if len(results) > 0 {
+			pct = count * 100 / len(results)
+		}
+		coverageData = append(coverageData, []string{name, fmt.Sprintf("%d", count), fmt.Sprintf("%d%%", pct)})
+	}
+
+	fmt.Println()
+	pterm.DefaultTable.WithHasHeader().WithData(coverageData).Render()
 }
