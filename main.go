@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/base64"
 	"encoding/csv"
 	"encoding/json"
@@ -17,7 +16,6 @@ import (
 	"sync"
 	"time"
 
-	copilot "github.com/github/copilot-sdk/go"
 	"github.com/pterm/pterm"
 )
 
@@ -44,16 +42,6 @@ type RepoResult struct {
 	WorkflowPushBranches    []string // branches in on.push.branches triggers
 	MostActiveCommitBranch  string   // branch with highest commit count in lookback
 	OldestBranch            string   // branch with the most total commits (deepest history)
-	// AI hypothesis (populated only with --analyze flag)
-	AIHypothesis *BranchHypothesis
-}
-
-// BranchHypothesis is the AI-generated analysis of production branch patterns.
-type BranchHypothesis struct {
-	MultipleProductionBranches bool     `json:"multiple_production_branches"`
-	CandidateBranches          []string `json:"candidate_branches"`
-	Confidence                 string   `json:"confidence"` // high, medium, low
-	Reasoning                  string   `json:"reasoning"`
 }
 
 // ---------- GraphQL helpers ----------
@@ -916,58 +904,42 @@ func unique(ss []string) []string {
 	return out
 }
 
-// ---------- Lightweight mode (combined query, 2 API calls per repo) ----------
+// ---------- Lightweight mode ----------
 
-// getLightweightSignals fetches protection rules + deployments in a single
-// GraphQL query, then releases in a single REST call. This is ~5x faster than
-// the full analysis since it avoids per-branch queries entirely.
-func getLightweightSignals(owner, repo string) (protectedBranches []string, deploymentBranches []string, releaseBranches []string, taggedBranches []string, err error) {
-	// Single GraphQL query for protection rules + deployments
+// getLightweightSignals fetches the most important signals quickly:
+// - Branch protection rules (GraphQL)
+// - Repo rulesets (REST, but only list + individual fetch)
+// - Tags/releases by branch (REST)
+// - Top PR merge target (REST, checks default + well-known branches only)
+func getLightweightSignals(owner, repo, defaultBranch string) (protectedBranches []string, rulesetBranches []string, taggedBranches []string, topPRTarget string, err error) {
+	// 1. Branch protection rules via GraphQL
 	query := `query($owner: String!, $repo: String!) {
 		repository(owner: $owner, name: $repo) {
 			branchProtectionRules(first: 50) {
 				nodes { pattern }
 			}
-			deployments(first: 100, environments: ["production"]) {
-				nodes {
-					ref { name }
-				}
-			}
 		}
 	}`
 
 	data, err := doGraphQL(query, map[string]interface{}{"owner": owner, "repo": repo})
-	if err != nil {
-		return nil, nil, nil, nil, err
-	}
-
-	var result struct {
-		Repository struct {
-			BranchProtectionRules struct {
-				Nodes []struct{ Pattern string }
-			}
-			Deployments struct {
-				Nodes []struct {
-					Ref *struct{ Name string }
+	if err == nil {
+		var result struct {
+			Repository struct {
+				BranchProtectionRules struct {
+					Nodes []struct{ Pattern string }
 				}
 			}
 		}
-	}
-	json.Unmarshal(data, &result)
-
-	for _, n := range result.Repository.BranchProtectionRules.Nodes {
-		protectedBranches = append(protectedBranches, n.Pattern)
-	}
-
-	deployCounts := map[string]int{}
-	for _, n := range result.Repository.Deployments.Nodes {
-		if n.Ref != nil && n.Ref.Name != "" {
-			deployCounts[n.Ref.Name]++
+		json.Unmarshal(data, &result)
+		for _, n := range result.Repository.BranchProtectionRules.Nodes {
+			protectedBranches = append(protectedBranches, n.Pattern)
 		}
 	}
-	deploymentBranches = sortedKeysByValue(deployCounts)
 
-	// Single REST call for releases + tags
+	// 2. Repo rulesets
+	rulesetBranches, _ = getRulesetBranches(owner, repo)
+
+	// 3. Tags from releases (which branches have tags)
 	body, _, restErr := doREST("GET", fmt.Sprintf("/repos/%s/%s/releases?per_page=%d", owner, repo, perPageREST))
 	if restErr == nil {
 		var releases []struct {
@@ -977,186 +949,36 @@ func getLightweightSignals(owner, repo string) (protectedBranches []string, depl
 		}
 		json.Unmarshal(body, &releases)
 
-		releaseCounts := map[string]int{}
 		tagCounts := map[string]int{}
 		for _, r := range releases {
-			if r.Draft {
-				continue
-			}
-			if r.TargetCommitish != "" {
-				releaseCounts[r.TargetCommitish]++
-				if r.TagName != "" {
-					tagCounts[r.TargetCommitish]++
-				}
+			if !r.Draft && r.TargetCommitish != "" && r.TagName != "" {
+				tagCounts[r.TargetCommitish]++
 			}
 		}
-		releaseBranches = sortedKeysByValue(releaseCounts)
 		taggedBranches = sortedKeysByValue(tagCounts)
 	}
 
-	return protectedBranches, deploymentBranches, releaseBranches, taggedBranches, nil
-}
+	// 4. Top PR merge target — check default + well-known branches (fast: few REST calls)
+	candidates := unique(append([]string{defaultBranch}, "main", "master", "production", "release", "deploy"))
+	topPRTarget, _ = getTopPRMergeTarget(owner, repo, candidates)
 
-// ---------- AI Hypothesis (Copilot SDK) ----------
-
-func formatSignalSummary(r RepoResult) string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("Repository: %s", r.Name))
-	lines = append(lines, fmt.Sprintf("Default branch: %s", r.DefaultBranch))
-	if len(r.ProtectedBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Protected branches: %s", strings.Join(r.ProtectedBranches, ", ")))
-	}
-	if len(r.RulesetTargetBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Ruleset-targeted branches: %s", strings.Join(r.RulesetTargetBranches, ", ")))
-	}
-	if len(r.DeploymentBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Branches deployed to production: %s", strings.Join(r.DeploymentBranches, ", ")))
-	}
-	if len(r.ReleaseTargetBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Release target branches: %s", strings.Join(r.ReleaseTargetBranches, ", ")))
-	}
-	if len(r.TaggedBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Branches with tags (by count): %s", strings.Join(r.TaggedBranches, ", ")))
-	}
-	if r.TopPRMergeTarget != "" {
-		lines = append(lines, fmt.Sprintf("Top PR merge target: %s", r.TopPRMergeTarget))
-	}
-	if len(r.WorkflowPushBranches) > 0 {
-		lines = append(lines, fmt.Sprintf("Workflow push trigger branches: %s", strings.Join(r.WorkflowPushBranches, ", ")))
-	}
-	if r.MostActiveCommitBranch != "" {
-		lines = append(lines, fmt.Sprintf("Most active branch (6mo): %s", r.MostActiveCommitBranch))
-	}
-	if r.OldestBranch != "" {
-		lines = append(lines, fmt.Sprintf("Deepest branch (total commits): %s", r.OldestBranch))
-	}
-	return strings.Join(lines, "\n")
-}
-
-func analyzeWithCopilot(ctx context.Context, results []RepoResult) error {
-	client := copilot.NewClient(&copilot.ClientOptions{
-		LogLevel: "error",
-	})
-	if err := client.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start Copilot client: %w", err)
-	}
-	defer client.Stop()
-
-	session, err := client.CreateSession(ctx, &copilot.SessionConfig{
-		Model: "claude-sonnet-4.5",
-		SystemMessage: &copilot.SystemMessageConfig{
-			Mode: "replace",
-			Content: `You are an expert at analyzing GitHub repository branching strategies.
-You will receive deterministic signal data for repositories and must produce a JSON hypothesis for each.
-
-Rules:
-- Respond ONLY with a JSON array — no markdown, no explanation, no code fences.
-- Each element must have: "repo" (string), "multiple_production_branches" (boolean), "candidate_branches" (string array), "confidence" ("high"/"medium"/"low"), "reasoning" (string, 1-2 sentences).
-- "candidate_branches" should list the branch name(s) you believe serve as production branches, ordered by likelihood.
-- Set "multiple_production_branches" to true ONLY when the evidence shows the repo actively maintains multiple long-lived branches that each independently serve production traffic or releases (e.g., release/1.x and release/2.x both receiving deployments or tags).
-- Patterns like release/* in workflow triggers or rulesets alone do NOT prove multiple production branches — they may be conventions for a single active release branch.
-- Confidence: "high" = strong convergence of 3+ signals; "medium" = 2 signals or some ambiguity; "low" = sparse data or conflicting signals.
-- If insufficient data, still provide your best guess with "low" confidence.`,
-		},
-		OnPermissionRequest: copilot.PermissionHandler.ApproveAll,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to create Copilot session: %w", err)
-	}
-	defer session.Disconnect()
-
-	// Build the prompt with all repo signal summaries
-	var promptParts []string
-	promptParts = append(promptParts, "Analyze the following repositories and return a JSON array with your hypothesis for each.\n")
-	for _, r := range results {
-		promptParts = append(promptParts, "---")
-		promptParts = append(promptParts, formatSignalSummary(r))
-	}
-	prompt := strings.Join(promptParts, "\n")
-
-	// Collect the full response
-	var responseBuf strings.Builder
-	done := make(chan bool)
-
-	session.On(func(event copilot.SessionEvent) {
-		switch d := event.Data.(type) {
-		case *copilot.AssistantMessageData:
-			responseBuf.WriteString(d.Content)
-		case *copilot.SessionIdleData:
-			close(done)
-		}
-	})
-
-	_, err = session.Send(ctx, copilot.MessageOptions{
-		Prompt: prompt,
-	})
-	if err != nil {
-		return fmt.Errorf("failed to send to Copilot: %w", err)
-	}
-
-	<-done
-
-	// Parse the JSON response
-	responseText := responseBuf.String()
-	// Strip markdown code fences if present
-	responseText = strings.TrimSpace(responseText)
-	if strings.HasPrefix(responseText, "```") {
-		lines := strings.Split(responseText, "\n")
-		if len(lines) > 2 {
-			lines = lines[1 : len(lines)-1]
-		}
-		responseText = strings.Join(lines, "\n")
-	}
-
-	var hypotheses []struct {
-		Repo                       string   `json:"repo"`
-		MultipleProductionBranches bool     `json:"multiple_production_branches"`
-		CandidateBranches          []string `json:"candidate_branches"`
-		Confidence                 string   `json:"confidence"`
-		Reasoning                  string   `json:"reasoning"`
-	}
-
-	if err := json.Unmarshal([]byte(responseText), &hypotheses); err != nil {
-		return fmt.Errorf("failed to parse Copilot response as JSON: %w\nResponse: %s", err, responseText[:min(len(responseText), 500)])
-	}
-
-	// Map hypotheses back to results
-	hypothesisMap := map[string]*BranchHypothesis{}
-	for _, h := range hypotheses {
-		hypothesisMap[h.Repo] = &BranchHypothesis{
-			MultipleProductionBranches: h.MultipleProductionBranches,
-			CandidateBranches:          h.CandidateBranches,
-			Confidence:                 h.Confidence,
-			Reasoning:                  h.Reasoning,
-		}
-	}
-
-	for i := range results {
-		if h, ok := hypothesisMap[results[i].Name]; ok {
-			results[i].AIHypothesis = h
-		}
-	}
-
-	return nil
+	return protectedBranches, rulesetBranches, taggedBranches, topPRTarget, nil
 }
 
 // ---------- Main ----------
 
 func main() {
 	if len(os.Args) < 2 {
-		pterm.Error.Println("Usage: prod-branch-report <org-slug> [output.csv] [--light] [--analyze]")
+		pterm.Error.Println("Usage: prod-branch-report <org-slug> [output.csv] [--light]")
 		os.Exit(1)
 	}
 
 	org := os.Args[1]
 	outputFile := ""
-	analyze := false
 	light := false
 
 	for _, arg := range os.Args[2:] {
 		switch arg {
-		case "--analyze":
-			analyze = true
 		case "--light":
 			light = true
 		default:
@@ -1175,7 +997,7 @@ func main() {
 	fmt.Println()
 	pterm.Info.Printfln("Organization: %s", pterm.Bold.Sprint(org))
 	if light {
-		pterm.Info.Println("Mode: lightweight (4 signals, ~2 API calls/repo)")
+		pterm.Info.Println("Mode: lightweight (5 signals: default branch, PR targets, rulesets, protection rules, tags)")
 	} else {
 		pterm.Info.Println("Mode: full (10 signals, ~10+ API calls/repo)")
 	}
@@ -1215,9 +1037,9 @@ func main() {
 		}
 
 		if light {
-			// Lightweight: 1 GraphQL + 1 REST call per repo
-			r.ProtectedBranches, r.DeploymentBranches, r.ReleaseTargetBranches, r.TaggedBranches, _ =
-				getLightweightSignals(owner, repoName)
+			// Lightweight: default branch + PR targets + rulesets + protection + tags
+			r.ProtectedBranches, r.RulesetTargetBranches, r.TaggedBranches, r.TopPRMergeTarget, _ =
+				getLightweightSignals(owner, repoName, repo.DefaultBranchName)
 		} else {
 			// Full: ~10+ API calls per repo
 			candidates, _ := listCandidateBranches(owner, repoName, repo.DefaultBranchName)
@@ -1242,48 +1064,7 @@ func main() {
 
 	fmt.Println()
 
-	// Phase 3: AI hypothesis (optional)
-	if analyze {
-		pterm.Info.Println("Running AI analysis with GitHub Copilot SDK...")
-
-		// Process in batches to stay within context limits
-		batchSize := 20
-		aiProgress, _ := pterm.DefaultProgressbar.
-			WithTotal(len(results)).
-			WithTitle("AI analysis").
-			WithBarCharacter("█").
-			WithLastCharacter("█").
-			WithElapsedTimeRoundingFactor(time.Second).
-			WithShowElapsedTime(true).
-			WithShowCount(true).
-			Start()
-
-		for i := 0; i < len(results); i += batchSize {
-			end := i + batchSize
-			if end > len(results) {
-				end = len(results)
-			}
-			batch := results[i:end]
-
-			aiProgress.UpdateTitle(fmt.Sprintf("AI analyzing batch %d-%d", i+1, end))
-
-			if err := analyzeWithCopilot(context.Background(), batch); err != nil {
-				pterm.Warning.Printfln("AI analysis failed for batch %d-%d: %v", i+1, end, err)
-			}
-
-			// Copy hypotheses back into results
-			for j, r := range batch {
-				results[i+j].AIHypothesis = r.AIHypothesis
-			}
-
-			for k := 0; k < len(batch); k++ {
-				aiProgress.Increment()
-			}
-		}
-		fmt.Println()
-	}
-
-	// Phase 4: Write CSV output
+	// Phase 3: Write CSV output
 	var writer *csv.Writer
 	if outputFile != "" {
 		f, err := os.Create(outputFile)
@@ -1310,9 +1091,6 @@ func main() {
 		"Most Active Branch (6mo)",
 		"Deepest Branch (total commits)",
 	}
-	if analyze {
-		header = append(header, "AI: Multiple Prod Branches?", "AI: Candidate Branches", "AI: Confidence", "AI: Reasoning")
-	}
 	writer.Write(header)
 
 	for _, r := range results {
@@ -1328,17 +1106,6 @@ func main() {
 			strings.Join(r.WorkflowPushBranches, "; "),
 			r.MostActiveCommitBranch,
 			r.OldestBranch,
-		}
-		if analyze {
-			if r.AIHypothesis != nil {
-				multi := "No"
-				if r.AIHypothesis.MultipleProductionBranches {
-					multi = "Yes"
-				}
-				row = append(row, multi, strings.Join(r.AIHypothesis.CandidateBranches, "; "), r.AIHypothesis.Confidence, r.AIHypothesis.Reasoning)
-			} else {
-				row = append(row, "", "", "", "")
-			}
 		}
 		writer.Write(row)
 	}

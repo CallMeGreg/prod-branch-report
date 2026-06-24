@@ -33,18 +33,15 @@ All signal collection is fully deterministic — no AI involved. The same inputs
 | Most Active Branch (6mo) | Branch with the highest commit count in the last 6 months | GraphQL: `history(since: ...)` |
 | Deepest Branch (total commits) | Branch with the most total commits (proxy for longest-lived) | GraphQL: `history(first: 0)` → `totalCount` |
 
-## AI hypothesis (`--analyze`)
+## LLM Analysis (separate step)
 
-With the `--analyze` flag, the tool uses the **GitHub Copilot SDK** to analyze the deterministic signal data and produce a per-repo hypothesis. This adds 4 extra CSV columns:
+Instead of built-in AI, this tool provides a prompt file (`ANALYSIS_PROMPT.md`) that you can use with any LLM to analyze the CSV output. The LLM will produce a separate report with:
 
-| Column | Description |
-|--------|-------------|
-| AI: Multiple Prod Branches? | Whether the repo likely maintains multiple production branches (Yes/No) |
-| AI: Candidate Branches | The branch(es) most likely serving as production, ordered by likelihood |
-| AI: Confidence | high / medium / low — based on signal convergence |
-| AI: Reasoning | 1-2 sentence explanation of the hypothesis |
+- Whether each repo likely has 1 or multiple production branches
+- Which branch(es) are the best candidates
+- Confidence level and reasoning
 
-The AI layer is strictly read-only over the deterministic data — it never calls GitHub APIs or modifies results. It processes repos in batches of 20 to stay within context limits.
+This keeps the tool itself fully deterministic while letting you use your preferred LLM for the interpretive step.
 
 ## Usage
 
@@ -55,14 +52,8 @@ export GITHUB_TOKEN=ghp_...
 # Run against an org, output to CSV
 go run main.go <org-slug> report.csv
 
-# Lightweight mode — 4 signals, ~2 API calls/repo (~5x faster)
+# Lightweight mode — 5 key signals, faster
 go run main.go <org-slug> report.csv --light
-
-# Include AI hypothesis
-go run main.go <org-slug> report.csv --analyze
-
-# Combine lightweight + AI hypothesis
-go run main.go <org-slug> report.csv --light --analyze
 
 # Output to stdout
 go run main.go <org-slug>
@@ -70,19 +61,18 @@ go run main.go <org-slug>
 
 ### Modes
 
-| Mode | Signals | API calls/repo | Speed |
-|------|---------|----------------|-------|
-| Full (default) | 10 | ~10+ | ~8 min for 110 repos |
-| `--light` | 4 | ~2 | ~1.5 min for 110 repos |
+| Mode | Signals | Focus |
+|------|---------|-------|
+| Full (default) | 10 | All available signals including deployments, workflows, commit velocity |
+| `--light` | 5 | Default branch, PR targets, rulesets, branch protection, tags |
 
-**Lightweight mode** collects only: default branch, protected branches, deployment branches (prod), release target branches, and tagged branches. It skips rulesets, PR merge targets, workflow analysis, commit velocity, and branch depth — these all require many additional API calls per repo.
+**Lightweight mode** focuses on the signals most reliably indicative of production branches: which branches receive PRs, which are protected by rules/rulesets, and which have release tags. It skips deployments, workflow parsing, commit velocity, and branch depth.
 
 ## Requirements
 
 - Go 1.24+
 - A GitHub token with `repo` scope (or a GitHub App with equivalent permissions)
 - Falls back to `gh auth token` if `GITHUB_TOKEN` is not set
-- For `--analyze`: GitHub Copilot CLI installed and in `PATH` (requires a Copilot subscription)
 
 ## Rate Limit Handling
 
@@ -101,4 +91,4 @@ The tool handles both primary and secondary GitHub API rate limits:
 - Tag-to-branch mapping uses release `target_commitish` rather than git ancestry (faster, but misses tags not associated with releases)
 - Rulesets are checked at the repo level only (org-level rulesets require `admin:org` scope and are not included)
 - Rate limits may require multiple runs for large orgs (500+ repos)
-- AI analysis requires the Copilot CLI and a Copilot subscription
+
