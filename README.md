@@ -16,7 +16,9 @@ The default branch is often — but not always — the production branch. Branch
 
 This tool doesn't try to give you a definitive answer. Instead, it produces a **report with multiple signals as columns**, letting you (the human) apply judgment across the data. Look for convergence: when multiple signals point to the same branch, confidence is high. When signals diverge, it's worth investigating.
 
-## Signals collected
+## Signals collected (deterministic)
+
+All signal collection is fully deterministic — no AI involved. The same inputs always produce the same outputs.
 
 | Column | What it tells you | API Source |
 |--------|-------------------|------------|
@@ -31,6 +33,19 @@ This tool doesn't try to give you a definitive answer. Instead, it produces a **
 | Most Active Branch (6mo) | Branch with the highest commit count in the last 6 months | GraphQL: `history(since: ...)` |
 | Deepest Branch (total commits) | Branch with the most total commits (proxy for longest-lived) | GraphQL: `history(first: 0)` → `totalCount` |
 
+## AI hypothesis (`--analyze`)
+
+With the `--analyze` flag, the tool uses the **GitHub Copilot SDK** to analyze the deterministic signal data and produce a per-repo hypothesis. This adds 4 extra CSV columns:
+
+| Column | Description |
+|--------|-------------|
+| AI: Multiple Prod Branches? | Whether the repo likely maintains multiple production branches (Yes/No) |
+| AI: Candidate Branches | The branch(es) most likely serving as production, ordered by likelihood |
+| AI: Confidence | high / medium / low — based on signal convergence |
+| AI: Reasoning | 1-2 sentence explanation of the hypothesis |
+
+The AI layer is strictly read-only over the deterministic data — it never calls GitHub APIs or modifies results. It processes repos in batches of 20 to stay within context limits.
+
 ## Usage
 
 ```bash
@@ -40,15 +55,28 @@ export GITHUB_TOKEN=ghp_...
 # Run against an org, output to CSV
 go run main.go <org-slug> report.csv
 
+# Include AI hypothesis
+go run main.go <org-slug> report.csv --analyze
+
 # Output to stdout
 go run main.go <org-slug>
 ```
 
 ## Requirements
 
-- Go 1.21+
+- Go 1.24+
 - A GitHub token with `repo` scope (or a GitHub App with equivalent permissions)
 - Falls back to `gh auth token` if `GITHUB_TOKEN` is not set
+- For `--analyze`: GitHub Copilot CLI installed and in `PATH` (requires a Copilot subscription)
+
+## Rate Limit Handling
+
+The tool handles both primary and secondary GitHub API rate limits:
+
+- **Primary limits**: Checks `X-RateLimit-Remaining` and `X-RateLimit-Reset` headers. When exhausted, waits until the reset window with a visible countdown.
+- **Secondary limits**: Detects `Retry-After` headers on 403/429 responses and waits the specified duration.
+- Retries up to 3 times per request on rate limit hits.
+- Displays clear warnings with wait times when rate limits are encountered.
 
 ## Limitations
 
@@ -58,3 +86,4 @@ go run main.go <org-slug>
 - Tag-to-branch mapping uses release `target_commitish` rather than git ancestry (faster, but misses tags not associated with releases)
 - Rulesets are checked at the repo level only (org-level rulesets require `admin:org` scope and are not included)
 - Rate limits may require multiple runs for large orgs (500+ repos)
+- AI analysis requires the Copilot CLI and a Copilot subscription
