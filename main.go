@@ -1083,10 +1083,10 @@ func main() {
 		"Default Branch",
 		"Protected Branches",
 		"Ruleset Target Branches",
-		"Deployment Branches (prod)",
-		"Release Target Branches",
 		"Tagged Branches (by count)",
 		"Top PR Merge Target",
+		"Deployment Branches (prod)",
+		"Release Target Branches",
 		"Workflow Push Branches",
 		"Most Active Branch (6mo)",
 		"Deepest Branch (total commits)",
@@ -1099,10 +1099,10 @@ func main() {
 			r.DefaultBranch,
 			strings.Join(r.ProtectedBranches, "; "),
 			strings.Join(r.RulesetTargetBranches, "; "),
-			strings.Join(r.DeploymentBranches, "; "),
-			strings.Join(r.ReleaseTargetBranches, "; "),
 			strings.Join(r.TaggedBranches, "; "),
 			r.TopPRMergeTarget,
+			strings.Join(r.DeploymentBranches, "; "),
+			strings.Join(r.ReleaseTargetBranches, "; "),
 			strings.Join(r.WorkflowPushBranches, "; "),
 			r.MostActiveCommitBranch,
 			r.OldestBranch,
@@ -1118,43 +1118,43 @@ func main() {
 		pterm.Success.Printfln("Report complete (%d repos)", len(results))
 	}
 
-	// Print signal coverage summary
-	signalNames := []string{
-		"Protected Branches", "Ruleset Targets", "Deployments (prod)",
-		"Release Targets", "Tagged Branches", "PR Merge Target",
-		"Workflow Push", "Commit Activity", "Branch Depth",
+	// Print signal coverage summary.
+	// `light` marks signals collected in lightweight mode; in that mode we
+	// only show those signals to avoid listing rows that are always 0%.
+	type signalDef struct {
+		name  string
+		light bool
+		has   func(RepoResult) bool
+	}
+	signals := []signalDef{
+		{"Default Branch", true, func(r RepoResult) bool { return r.DefaultBranch != "" }},
+		{"Protected Branches", true, func(r RepoResult) bool { return len(r.ProtectedBranches) > 0 }},
+		{"Ruleset Targets", true, func(r RepoResult) bool { return len(r.RulesetTargetBranches) > 0 }},
+		{"Deployments (prod)", false, func(r RepoResult) bool { return len(r.DeploymentBranches) > 0 }},
+		{"Release Targets", false, func(r RepoResult) bool { return len(r.ReleaseTargetBranches) > 0 }},
+		{"Tagged Branches", true, func(r RepoResult) bool { return len(r.TaggedBranches) > 0 }},
+		{"PR Merge Target", true, func(r RepoResult) bool { return r.TopPRMergeTarget != "" }},
+		{"Workflow Push", false, func(r RepoResult) bool { return len(r.WorkflowPushBranches) > 0 }},
+		{"Commit Activity", false, func(r RepoResult) bool { return r.MostActiveCommitBranch != "" }},
+		{"Branch Depth", false, func(r RepoResult) bool { return r.OldestBranch != "" }},
 	}
 	var coverageData pterm.TableData
 	coverageData = append(coverageData, []string{"Signal", "Repos with data", "Coverage"})
-	for i, name := range signalNames {
+	for _, sig := range signals {
+		if light && !sig.light {
+			continue
+		}
 		count := 0
 		for _, r := range results {
-			switch i {
-			case 0:
-				if len(r.ProtectedBranches) > 0 { count++ }
-			case 1:
-				if len(r.RulesetTargetBranches) > 0 { count++ }
-			case 2:
-				if len(r.DeploymentBranches) > 0 { count++ }
-			case 3:
-				if len(r.ReleaseTargetBranches) > 0 { count++ }
-			case 4:
-				if len(r.TaggedBranches) > 0 { count++ }
-			case 5:
-				if r.TopPRMergeTarget != "" { count++ }
-			case 6:
-				if len(r.WorkflowPushBranches) > 0 { count++ }
-			case 7:
-				if r.MostActiveCommitBranch != "" { count++ }
-			case 8:
-				if r.OldestBranch != "" { count++ }
+			if sig.has(r) {
+				count++
 			}
 		}
 		pct := 0
 		if len(results) > 0 {
 			pct = count * 100 / len(results)
 		}
-		coverageData = append(coverageData, []string{name, fmt.Sprintf("%d", count), fmt.Sprintf("%d%%", pct)})
+		coverageData = append(coverageData, []string{sig.name, fmt.Sprintf("%d", count), fmt.Sprintf("%d%%", pct)})
 	}
 
 	fmt.Println()
