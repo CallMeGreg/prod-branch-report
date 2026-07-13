@@ -414,7 +414,7 @@ def get_tag_count_by_branch(owner: str, repo: str) -> dict[str, int]:
 
 
 def get_top_pr_merge_target(owner: str, repo: str, candidate_branches: list[str]) -> str:
-    """Signal: branch receiving the most merged PRs among the top candidates (REST)."""
+    """Signal: branch receiving the most closed PRs among the top candidates (REST)."""
     if not candidate_branches:
         return ""
 
@@ -422,10 +422,10 @@ def get_top_pr_merge_target(owner: str, repo: str, candidate_branches: list[str]
     for branch in candidate_branches[:5]:
         path = f"/repos/{owner}/{repo}/pulls?state=closed&base={branch}&per_page=1"
         try:
-            _, headers = do_rest("GET", path)
+            body, headers = do_rest("GET", path)
         except RuntimeError:
             continue
-        count = estimate_count_from_link(headers.get("Link", ""))
+        count = estimate_count_from_response(body, headers.get("Link", ""))
         results.append((branch, count))
 
     if not results:
@@ -670,10 +670,10 @@ def sorted_keys_by_value(m: dict[str, int]) -> list[str]:
     return [k for k, _ in sorted(m.items(), key=lambda kv: kv[1], reverse=True)]
 
 
-def estimate_count_from_link(link: str) -> int:
-    """Estimate a total count from a REST ``Link`` header's ``rel="last"`` page number."""
+def _last_page_from_link(link: str) -> Optional[int]:
+    """Return the ``rel="last"`` page number from a REST ``Link`` header, if present."""
     if not link:
-        return 1
+        return None
     for part in link.split(","):
         if 'rel="last"' in part:
             start = part.rfind("page=")
@@ -686,8 +686,28 @@ def estimate_count_from_link(link: str) -> int:
             try:
                 return int(num_str)
             except ValueError:
-                return 1
-    return 1
+                return None
+    return None
+
+
+def estimate_count_from_response(body: bytes, link: str) -> int:
+    """Estimate the total item count for a ``per_page=1`` listing.
+
+    With ``per_page=1`` each page holds one item, so the ``rel="last"`` page
+    number in the ``Link`` header equals the total count. GitHub omits the
+    ``Link`` header entirely when the results fit on a single page (0 or 1
+    items), so when it is absent we fall back to the number of items actually
+    returned in the body. This correctly reports 0 for an empty result set
+    instead of a spurious 1.
+    """
+    page = _last_page_from_link(link)
+    if page is not None:
+        return page
+    try:
+        items = _json_loads(body) if body else []
+    except ValueError:
+        return 0
+    return len(items) if isinstance(items, list) else 0
 
 
 def unique(items: list[str]) -> list[str]:
