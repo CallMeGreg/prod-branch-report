@@ -134,14 +134,6 @@ These mirror the Go implementation:
 
 This script is a behavior-faithful port of `../main.go`: the same signals, the
 same CSV columns (in the same order), the same full/light modes, and the same
-rate-limit strategy. Intentional differences:
-
-- **Log/progress output goes to stderr** (instead of stdout) so piping the CSV
-  works cleanly.
-- **Top PR Merge Target reports 0 correctly.** The Go version estimates the PR
-  count from the REST `Link` header only; because GitHub omits that header when
-  the results fit on one page, a branch with **0** closed PRs is reported as
-  `(1 PRs)`. This port falls back to the number of items in the response body
-  when the `Link` header is absent, so 0-PR branches are correctly treated as
-  having no PRs. (The Go implementation still has this off-by-one.)
+rate-limit strategy. The only intentional difference is that log/progress output
+is sent to stderr (instead of stdout) so piping the CSV works cleanly.
 
