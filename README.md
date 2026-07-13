@@ -81,8 +81,10 @@ go run main.go <org-slug>
 
 ## Requirements
 
-- Go 1.24+
-- A GitHub token with `repo` scope (or a GitHub App with equivalent permissions)
+- A runtime for whichever [implementation](#implementations) you use:
+  - **Go** 1.24+ (for `go run main.go`), or
+  - **Python** 3.9+ with the [`python/`](python/) dependencies (see [`python/README.md`](python/README.md))
+- A GitHub token with `repo` scope (or a GitHub App with equivalent permissions) — applies to both implementations
 - Falls back to `gh auth token` if `GITHUB_TOKEN` is not set
 
 ## Rate Limit Handling
