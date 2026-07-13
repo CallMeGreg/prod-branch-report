@@ -1,6 +1,17 @@
 # prod-branch-report
 
-A Go tool that analyzes repositories across a GitHub organization to identify which branches are likely being used as "production" branches.
+A tool that analyzes repositories across a GitHub organization to identify which branches are likely being used as "production" branches.
+
+## Implementations
+
+This project ships **two implementations** — pick whichever fits your environment:
+
+| Option | Where | Run it | Requires |
+|--------|-------|--------|----------|
+| **Go** (original) | repository root ([`main.go`](main.go)) | `go run main.go <org-slug> report.csv` | Go 1.24+ |
+| **Python** (port) | [`python/`](python/) directory | `python prod_branch_report.py <org-slug> report.csv` | Python 3.9+ |
+
+Both collect the same signals, produce the same CSV columns (in the same order), and support the same full/`--light` modes. The rest of this README documents the Go tool; the Python version has its own setup and usage guide in [`python/README.md`](python/README.md).
 
 ## Why this is hard
 
@@ -70,8 +81,10 @@ go run main.go <org-slug>
 
 ## Requirements
 
-- Go 1.24+
-- A GitHub token with `repo` scope (or a GitHub App with equivalent permissions)
+- A runtime for whichever [implementation](#implementations) you use:
+  - **Go** 1.24+ (for `go run main.go`), or
+  - **Python** 3.9+ with the [`python/`](python/) dependencies (see [`python/README.md`](python/README.md))
+- A GitHub token with `repo` scope (or a GitHub App with equivalent permissions) — applies to both implementations
 - Falls back to `gh auth token` if `GITHUB_TOKEN` is not set
 
 ## Rate Limit Handling
