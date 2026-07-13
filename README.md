@@ -4,7 +4,7 @@ A tool that analyzes repositories across a GitHub organization to identify which
 
 ## Implementations
 
-This project ships **two behavior-faithful implementations** — pick whichever fits your environment:
+This project ships **two implementations** — pick whichever fits your environment:
 
 | Option | Where | Run it | Requires |
 |--------|-------|--------|----------|
