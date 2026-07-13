@@ -495,14 +495,13 @@ func getTopPRMergeTarget(owner, repo string, candidateBranches []string) (string
 	var results []branchCount
 
 	for _, branch := range candidateBranches[:limit] {
-		// Use per_page=1 and check total count from response
+		// Use per_page=1 and derive the total count from the response
 		path := fmt.Sprintf("/repos/%s/%s/pulls?state=closed&base=%s&per_page=1", owner, repo, branch)
-		_, headers, err := doREST("GET", path)
+		body, headers, err := doREST("GET", path)
 		if err != nil {
 			continue
 		}
-		// Parse Link header to estimate total count
-		count := estimateCountFromLink(headers.Get("Link"))
+		count := estimateCountFromResponse(body, headers.Get("Link"))
 		results = append(results, branchCount{branch: branch, count: count})
 	}
 
@@ -866,10 +865,12 @@ func sortedKeysByValue(m map[string]int) []string {
 	return keys
 }
 
-func estimateCountFromLink(link string) int {
+// lastPageFromLink returns the rel="last" page number from a REST Link header
+// and whether one was present.
+func lastPageFromLink(link string) (int, bool) {
 	// Parse Link header: <...?page=42>; rel="last"
 	if link == "" {
-		return 1
+		return 0, false
 	}
 	parts := strings.Split(link, ",")
 	for _, part := range parts {
@@ -885,11 +886,30 @@ func estimateCountFromLink(link string) int {
 				numStr = numStr[:end]
 			}
 			var n int
-			fmt.Sscanf(numStr, "%d", &n)
-			return n
+			if _, err := fmt.Sscanf(numStr, "%d", &n); err != nil {
+				return 0, false
+			}
+			return n, true
 		}
 	}
-	return 1
+	return 0, false
+}
+
+// estimateCountFromResponse estimates the total item count for a per_page=1
+// listing. With per_page=1 each page holds one item, so the rel="last" page
+// number in the Link header equals the total count. GitHub omits the Link
+// header entirely when the results fit on a single page (0 or 1 items), so when
+// it is absent we fall back to the number of items actually returned in the
+// body. This correctly reports 0 for an empty result set instead of a spurious 1.
+func estimateCountFromResponse(body []byte, link string) int {
+	if page, ok := lastPageFromLink(link); ok {
+		return page
+	}
+	var items []json.RawMessage
+	if err := json.Unmarshal(body, &items); err != nil {
+		return 0
+	}
+	return len(items)
 }
 
 func unique(ss []string) []string {
